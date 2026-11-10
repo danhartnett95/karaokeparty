@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jeopardy Trivia Game</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css?v=2">
+    <script>
+        // Define this early before the SDK loads - use a placeholder function instead of null
+        window.onSpotifyWebPlaybackSDKReady = function() {
+            // Will be replaced by actual handler in script.js
+        };
+    </script>
+    <script src="https://sdk.scdn.co/spotify-player.js"></script>
+</head>
+<body>
+    <!-- Fullscreen toggle - top right on every page -->
+    <button type="button" class="fullscreen-toggle" id="fullscreenToggle" title="Toggle full screen" aria-label="Toggle full screen">
+        <svg class="fullscreen-icon fullscreen-expand" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+        </svg>
+        <svg class="fullscreen-icon fullscreen-exit" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 4v4h4 M20 4v4h-4 M4 20v-4h4 M20 20v-4h-4"/>
+        </svg>
+    </button>
+    <div id="appRoot" class="app-root">
+    <!-- Success Notification -->
+    <div class="spotify-success-notification" id="spotifySuccessNotification">
+        Spotify Connection Successful!
+    </div>
+
+    <!-- Connect to Spotify Page (first screen) -->
+    <div class="connect-page" id="connectPage" style="display: none;">
+        <button class="connect-page-skip-btn" id="connectSkipBtn">Continue without connecting</button>
+        <div class="connect-content">
+            <button type="button" class="connect-main-btn" id="connectSpotifyLoginBtn">Connect to Spotify</button>
+            <p id="connectPageStatus" style="color: rgba(255,255,255,0.75); font-size: 0.95rem; max-width: min(90vw, 500px); text-align: center; margin: 0; min-height: 1.25em;" aria-live="polite"></p>
+            <button class="continue-btn connect-main-btn" id="connectContinueBtn" style="display: none;">Continue</button>
+        </div>
+    </div>
+
+    <!-- Landing Page -->
+    <div class="landing-page" id="landingPage" style="display: none;">
+        <!-- Ambient atmospheric haze -->
+        <div class="disco-ambient"></div>
+        <!-- Simple party accent: soft glowing orb -->
+        <!-- Floating light dots -->
+        <div class="disco-shimmer" id="discoShimmer"></div>
+        <div class="confetti-container" id="confettiContainer"></div>
+        <div class="club-lights">
+            <div class="club-light club-light-1"></div>
+            <div class="club-light club-light-2"></div>
+            <div class="club-light club-light-3"></div>
+            <div class="club-light club-light-4"></div>
+            <div class="club-light club-light-5"></div>
+            <div class="club-light club-light-6"></div>
+        </div>
+        <button class="landing-skip-connect-btn" id="skipConnectBtn">Continue without connecting</button>
+        <div class="landing-content">
+            <h1 class="landing-title">KARAOKE PARTY!</h1>
+            <button type="button" class="spotify-btn landing-spotify-btn" id="landingSpotifyLoginBtn">Connect to Spotify</button>
+            <button class="continue-btn landing-spotify-btn" id="continueBtn" style="display: none;">Start the game</button>
+            <button class="spotify-disconnect-btn" id="spotifyDisconnectBtn" style="display: none;">Disconnect from Spotify</button>
+        </div>
+    </div>
+
+    <!-- Team Selection Page (hidden initially) -->
+    <div class="team-selection-page" id="teamSelectionPage" style="display: none;">
+        <div class="disco-shimmer disco-shimmer-bg" data-disco-dots></div>
+        <button class="back-btn" id="teamSelectionBackBtn">Back</button>
+        <div class="confetti-container" id="teamSelectionConfettiContainer"></div>
+        <div class="team-selection-container">
+            <header class="team-selection-header">
+                <h1 style="cursor: pointer;" title="Click to return to home" id="teamSelectionHeader">KARAOKE PARTY!</h1>
+            </header>
+            <div class="team-selection-content">
+                <h2 class="team-selection-text">How Many Teams Are Playing?</h2>
+                <div class="team-count-buttons">
+                    <button class="team-count-btn" data-team-count="1">One Team</button>
+                    <button class="team-count-btn" data-team-count="2">Two Teams</button>
+                    <button class="team-count-btn" data-team-count="3">Three Teams</button>
+                    <button class="team-count-btn" data-team-count="4">Four Teams</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Team Naming Page (hidden initially) -->
+    <div class="team-naming-page" id="teamNamingPage" style="display: none;">
+        <div class="disco-shimmer disco-shimmer-bg" data-disco-dots></div>
+        <button class="back-btn" id="teamNamingBackBtn">Back</button>
+        <div class="confetti-container" id="teamNamingConfettiContainer"></div>
+        <div class="team-naming-container">
+            <header class="team-naming-header">
+                <h1 style="cursor: pointer;" title="Click to return to home" id="teamNamingHeader">KARAOKE PARTY!</h1>
+            </header>
+            <div class="team-naming-content">
+                <h2 class="team-naming-text">Name Your Teams</h2>
+                <div class="team-inputs-container" id="teamInputsContainer">
+                    <!-- Team inputs will be generated here -->
+                </div>
+                <button class="team-naming-continue-btn" id="teamNamingContinueBtn" disabled>Continue</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Category Selection Page (hidden initially) -->
+    <div class="category-selection-page" id="categorySelectionPage" style="display: none;">
+        <div class="disco-shimmer disco-shimmer-bg" data-disco-dots></div>
+        <div class="category-selection-top-buttons">
+            <button class="back-btn" id="categorySelectionBackBtn">Back</button>
+            <button class="refresh-categories-btn" id="refreshCategoriesBtn" type="button">Refresh Categories</button>
+        </div>
+        <div class="confetti-container" id="categoryConfettiContainer"></div>
+        <div class="category-selection-container">
+            <header class="category-selection-header">
+                <h1 id="categorySelectionHeader" style="cursor: pointer;" title="Click to return to home">KARAOKE PARTY!</h1>
+            </header>
+            <div class="category-selection-content">
+                <h2 class="choose-categories-text">Choose Your Six Categories</h2>
+                <div class="loading-spinner hidden" id="categorySelectionSpinner">
+                    <div class="spinner"></div>
+                    <p class="loading-text">Loading categories...</p>
+                </div>
+                <div class="playlist-buttons-grid" id="playlistButtonsGrid">
+                    <!-- Playlist buttons will be generated here -->
+                </div>
+                <button class="category-continue-btn" id="categoryContinueBtn" style="display: none;">Continue</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Game (hidden initially) -->
+    <div class="container" id="gameContainer" style="display: none;">
+        <div class="disco-shimmer disco-shimmer-bg" data-disco-dots></div>
+        <div class="game-top-buttons">
+            <button class="back-btn" id="gameBackBtn">Back</button>
+            <button class="reset-btn" id="resetBtn">New Game</button>
+            <button class="reset-btn undo-song-btn" id="undoSongBtn">Undo Song</button>
+        </div>
+        <!-- Loading Spinner (shown while category playlists are loading) -->
+        <div class="loading-spinner hidden" id="loadingSpinner">
+            <div class="spinner"></div>
+            <p class="loading-text">Loading categories...</p>
+        </div>
+        <div id="spotifyStatus" style="display: none !important; visibility: hidden; padding: 10px; margin: 10px; background: rgba(255,255,255,0.1); border-radius: 5px; position: absolute; top: 50px; right: 0;">
+            <span id="spotifyStatusText"></span>
+            <select id="playlistSelect" style="display: none !important; margin-left: 10px; padding: 5px;">
+                <option value="">Select a playlist...</option>
+            </select>
+        </div>
+        <header>
+            <h1 id="gameHeader">KARAOKE PARTY!</h1>
+            <div class="scoreboard">
+                <div class="team-score team-one-score">
+                    <div class="team-label">Team One</div>
+                    <div class="team-amount" id="teamOneScore">$0</div>
+                </div>
+                <div class="team-score team-two-score">
+                    <div class="team-label">Team Two</div>
+                    <div class="team-amount" id="teamTwoScore">$0</div>
+                </div>
+            </div>
+        </header>
+
+        <div class="board-stage" id="boardStage">
+            <div class="board" id="board" style="display: none;">
+                <!-- Board will be generated by JavaScript -->
+            </div>
+            <div class="winner-celebration" id="winnerCelebration" style="display: none;">
+                <div class="winner-celebration-card">
+                    <div class="winner-celebration-badge">Winner!</div>
+                    <h2 class="winner-celebration-title" id="winnerCelebrationTitle">Congratulations!</h2>
+                    <p class="winner-celebration-message" id="winnerCelebrationMessage"></p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Modal for reset options -->
+        <div class="modal" id="resetModal">
+            <div class="modal-content reset-modal-content">
+                <div class="modal-header">
+                    <span class="category-name">Reset Game Options</span>
+                </div>
+                <div class="modal-body">
+                    <div class="reset-options">
+                        <button class="reset-option-btn" id="resetThisGameBtn">Reset This Game</button>
+                        <button class="reset-option-btn" id="restartWithNewSongsBtn">New Songs</button>
+                        <button class="reset-option-btn" id="chooseNewCategoriesBtn">New Categories</button>
+                        <button class="reset-option-btn home-page-btn" id="homePageBtn">Home Page</button>
+                        <button class="reset-option-btn cancel-btn" id="cancelResetBtn">Cancel</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Modal for questions and answers -->
+        <div class="modal" id="modal">
+        <div class="modal-content">
+            <img id="modalAlbumCover" class="modal-album-cover" src="" alt="Album Cover" style="display: none;">
+            <div class="modal-header">
+                <div class="category-value-container" style="display: flex; gap: 15px; align-items: flex-start; position: relative; z-index: 1; flex-direction: row;">
+                    <div class="category-answer-group">
+                        <div class="category-dollar-row" style="display: flex; gap: 15px; align-items: center;">
+                            <span class="category-name" id="modalCategory"></span>
+                            <span class="dollar-value" id="modalValue"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="timer" id="modalTimer" style="display: none;">60</div>
+            </div>
+            <div class="modal-body">
+                <div class="waveform-container" id="waveformContainer" style="display: none;">
+                    <canvas id="waveformCanvas"></canvas>
+                </div>
+                <div class="question-text" id="questionText"></div>
+            </div>
+            <div class="modal-footer">
+                <div class="buttons-row">
+                    <button class="modal-btn team-btn team-one-btn" id="teamOneBtn">Team One</button>
+                    <button class="modal-btn team-btn team-two-btn" id="teamTwoBtn">Team Two</button>
+                    <button class="modal-btn team-btn incorrect-btn" id="incorrectBtn">Incorrect</button>
+                </div>
+                <div class="modal-bottom-section">
+                    <div class="modal-bottom-section-left">
+                        <button class="modal-btn undo-btn-bottom keeps-space-hidden" id="undoBtnBottom">Undo</button>
+                    </div>
+                    <div class="modal-scoreboard-buttons" id="modalScoreboardButtons" style="display: none;">
+                        <!-- Team buttons will be dynamically generated here -->
+                    </div>
+                    <div class="modal-bottom-section-spacer" aria-hidden="true"></div>
+                </div>
+            </div>
+            <!-- Answer reveal bar inside the same card -->
+            <div class="answer-reveal-section" id="answerRevealSection">
+                <div class="answer-left">
+                    <div class="answer-artist" id="answerArtist"></div>
+                    <div class="answer-song" id="answerSong"></div>
+                </div>
+                <div class="answer-right">
+                    <div class="answer-category" id="answerCategory"></div>
+                    <div class="answer-amount" id="answerAmount"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+        <!-- Move On button: outside modal, bottom-left of screen, 2x size -->
+        <button class="move-on-btn-bottom" id="moveOnBtnBottom" style="display: none;">Move On</button>
+
+    </div>
+    <script>
+    (function() {
+        // === Generate floating light dots on ALL pages ===
+        const dotColors = [
+            'rgba(255, 50, 150, 0.8)',
+            'rgba(50, 180, 255, 0.8)',
+            'rgba(255, 220, 50, 0.8)',
+            'rgba(50, 255, 130, 0.8)',
+            'rgba(180, 50, 255, 0.8)',
+            'rgba(255, 130, 50, 0.8)',
+            'rgba(255, 255, 255, 0.9)',
+            'rgba(0, 220, 220, 0.7)',
+        ];
+        function fillDots(container, count) {
+            if (!container) return;
+            for (let i = 0; i < count; i++) {
+                const dot = document.createElement('div');
+                dot.classList.add('disco-dot');
+                const size = Math.random() * 6 + 3;
+                dot.style.width = size + 'px';
+                dot.style.height = size + 'px';
+                const c = dotColors[Math.floor(Math.random() * dotColors.length)];
+                dot.style.background = c;
+                dot.style.left = Math.random() * 100 + '%';
+                dot.style.top = Math.random() * 100 + '%';
+                dot.style.setProperty('--dx', (Math.random() * 160 - 80) + 'px');
+                dot.style.setProperty('--dy', (Math.random() * 160 - 80) + 'px');
+                dot.style.animationDuration = (Math.random() * 4 + 3) + 's';
+                dot.style.animationDelay = (Math.random() * 6) + 's';
+                dot.style.boxShadow = '0 0 ' + (size * 3) + 'px ' + c;
+                container.appendChild(dot);
+            }
+        }
+        // Landing page gets more dots, other pages get a lighter amount
+        fillDots(document.getElementById('discoShimmer'), 40);
+        document.querySelectorAll('[data-disco-dots]').forEach(function(el) {
+            fillDots(el, 30);
+        });
+    })();
+    </script>
+    <script src="script.js?v=8" onerror="alert('Could not load script.js. Hard-refresh (Ctrl+Shift+R) or redeploy the site.')"></script>
+</body>
+</html>

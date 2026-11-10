@@ -1,0 +1,33 @@
+# Netlify configuration for Karaoke Party Jeopardy Game
+
+[build]
+  # This is a static site with no build process
+  publish = "."
+  command = "echo 'No build step required - static site'"
+
+# Redirect rules for single-page application (only when no file exists at that path)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+  force = false
+
+# Security headers
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-XSS-Protection = "1; mode=block"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+
+# Cache static assets (shorter cache for development)
+[[headers]]
+  for = "/*.css"
+  [headers.values]
+    Cache-Control = "public, max-age=3600"
+
+[[headers]]
+  for = "/*.js"
+  [headers.values]
+    Cache-Control = "public, max-age=3600"
