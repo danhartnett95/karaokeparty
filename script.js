@@ -1326,6 +1326,10 @@ async function startLandingPlaybackAfterConnect() {
                 clearLandingPlaybackGestureFallback();
                 return true;
             }
+            if (spotifyPlayerReconnecting) {
+                console.log('[Landing] Player is reconnecting; the song will start when it is ready');
+                return false;
+            }
             if (landingAutoplayBlocked) {
                 // Spotify says "playing" but the browser is holding the sound. Keep the fallback armed and stop
                 // retrying automatically; the next click/keypress starts the music.
@@ -1340,7 +1344,7 @@ async function startLandingPlaybackAfterConnect() {
     }
 
     // Every automatic attempt failed. The click/keypress fallback is still armed; tell the user to tap.
-    if (landingPlaybackStartPending) {
+    if (landingPlaybackStartPending && !spotifyPlayerReconnecting) {
         console.warn('[Landing] All automatic attempts failed; waiting for a click/keypress');
         showTapToStartMusicHint();
     }
@@ -2106,7 +2110,9 @@ async function startSpotifyLogin() {
     setConnectPageStatus(popup ? 'Log in to Spotify in the popup window…' : 'Opening Spotify…');
     console.log('[Spotify] Connect clicked — starting login' + (popup ? ' (popup)' : ' (popup blocked; using full-page redirect)'));
     try {
-        if (!spotifyReady) {
+        // Clear stale saved tokens before a fresh login, unless a player is already connecting/connected with
+        // them (clearing would make that player fail auth and get torn down; the new token replaces them anyway).
+        if (!spotifyReady && !(spotifyPlayer && spotifyPlayer.__kpConnectRequested)) {
             clearSpotifyTokens();
         }
         if (popup) {
@@ -2240,6 +2246,7 @@ async function completeSpotifyLoginWithCode(code) {
         return false;
     }
     try {
+        logLoginTiming('Requesting Spotify token');
         const response = await fetch('https://accounts.spotify.com/api/token', {
             method: 'POST',
             headers: {
@@ -2267,7 +2274,7 @@ async function completeSpotifyLoginWithCode(code) {
         // Start fetching the landing playlist now, in parallel with the player connecting.
         getLandingPlaylistTracks().then(t => { if (t && t.length) logLoginTiming(`Landing playlist loaded (${t.length} songs)`); }).catch(() => {});
         playLandingPlaylistOnReady = true;
-        initializeSpotify();
+        connectOrReuseSpotifyPlayer();
         setConnectPageStatus('');
         // Immediately go to KARAOKE PARTY! landing page after connecting
         if (window.navigateToPage) window.navigateToPage('landing');
@@ -2277,6 +2284,56 @@ async function completeSpotifyLoginWithCode(code) {
         setConnectPageStatus('Spotify login failed. Click Connect to Spotify to try again.', true);
         return false;
     }
+}
+
+/**
+ * After a fresh login: use the page's existing Spotify player if it already connected (e.g. from a saved
+ * session at page load) instead of destroying it and creating a second one. Seen live: a second player
+ * created in the same page reported "ready" but Spotify answered every request with 404 "Device not found".
+ * Reusing also keeps the player that the Connect click activated for audio.
+ */
+function connectOrReuseSpotifyPlayer() {
+    if (spotifyPlayer && spotifyPlayer.__kpConnectRequested) {
+        if (spotifyReady && spotifyDeviceId) {
+            console.log('[Spotify] Reusing the already-connected player for this login');
+            logLoginTiming('Reusing already-connected player');
+            // navigateToPage('landing') (called right after this) starts the landing song.
+            playLandingPlaylistOnReady = false;
+        } else {
+            console.log('[Spotify] Player is still connecting; the landing song will start when it is ready');
+            playLandingPlaylistOnReady = true;
+        }
+        return;
+    }
+    initializeSpotify();
+}
+
+/** True while we're reconnecting the player after a "Device not found"; its 'ready' event restarts the song. */
+let spotifyPlayerReconnecting = false;
+let spotifyPlayerReconnectCount = 0;
+
+/** Reconnect the SAME player object (never a new one). Limited to 2 per page load. */
+async function reconnectSpotifyPlayer(reason) {
+    if (!spotifyPlayer || spotifyPlayerReconnecting || spotifyPlayerReconnectCount >= 2) return false;
+    spotifyPlayerReconnecting = true;
+    spotifyPlayerReconnectCount++;
+    console.warn('[Spotify] Reconnecting the player: ' + reason);
+    try { await spotifyPlayer.disconnect(); } catch (e) { /* ignore */ }
+    spotifyReady = false;
+    spotifyDeviceId = null;
+    spotifyDevicePrimed = false;
+    playLandingPlaylistOnReady = true;
+    try {
+        const ok = await spotifyPlayer.connect();
+        if (!ok) {
+            console.warn('[Spotify] Reconnect was refused');
+            spotifyPlayerReconnecting = false;
+        }
+    } catch (e) {
+        console.warn('[Spotify] Reconnect failed', e);
+        spotifyPlayerReconnecting = false;
+    }
+    return true;
 }
 
 async function handleSpotifyCallback() {
@@ -2381,6 +2438,7 @@ function createSpotifyPlayerIfNeeded() {
     
     // Ready event
     spotifyPlayer.addListener('ready', ({ device_id }) => {
+        spotifyPlayerReconnecting = false;
         spotifyDeviceId = device_id;
         spotifyReady = true;
         spotifyDevicePrimed = false;
@@ -2789,6 +2847,9 @@ async function playRandomTrackFromLandingPlaylist() {
             return true;
         } else {
             console.warn(`[Landing] Could not play landing playlist track (${result.status}): ${result.errorText}`);
+            if (result.status === 404 && /device not found/i.test(result.errorText || '')) {
+                await reconnectSpotifyPlayer('Spotify does not recognise this browser player (404 Device not found)');
+            }
             return false;
         }
     } catch (error) {
