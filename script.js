@@ -196,6 +196,12 @@ let playLandingPlaylistOnReady = false;
 let landingPlaybackStartPending = false;
 let landingPlaybackStartInProgress = false;
 let landingPlaybackGestureCleanup = null;
+/**
+ * Set by the SDK's autoplay_failed event: the browser is holding this tab's audio until a click/keypress.
+ * While true, Spotify's servers may still say "playing", so a "started" result must NOT be trusted and the
+ * click/keypress fallback must stay armed. Cleared only when a retry runs inside a real user gesture.
+ */
+let landingAutoplayBlocked = false;
 
 const LANDING_PLAYLIST_ID = '4xUYhdcMjWStxOGWsTCfya'; // "Landing Screen Karaoke Party" – landing + selection pages until game board
 
@@ -1200,11 +1206,14 @@ function armLandingPlaybackGestureFallback() {
             if (spotifyPlayer && typeof spotifyPlayer.activateElement === 'function') {
                 try { await spotifyPlayer.activateElement(); } catch (e) { /* ignore */ }
             }
+            landingAutoplayBlocked = false; // a real click/keypress unlocks audio for this tab
             console.log('[Landing] Retrying landing song after user click/keypress');
             const started = await playRandomTrackFromLandingPlaylist();
-            if (started) {
+            if (started && !landingAutoplayBlocked) {
                 landingPlaybackStartPending = false;
                 clearLandingPlaybackGestureFallback();
+            } else if (landingAutoplayBlocked) {
+                showTapToStartMusicHint();
             }
         } finally {
             landingPlaybackStartInProgress = false;
@@ -1224,7 +1233,7 @@ function armLandingPlaybackGestureFallback() {
 }
 
 async function startLandingPlaybackAfterConnect() {
-    if (spotifyReady && spotifyDeviceId) {
+    if (spotifyReady && spotifyDeviceId && !landingAutoplayBlocked) {
         const state = await getSpotifyPlaybackState();
         if (state && state.is_playing) {
             landingPlaybackStartPending = false;
@@ -1235,6 +1244,11 @@ async function startLandingPlaybackAfterConnect() {
 
     landingPlaybackStartPending = true;
     armLandingPlaybackGestureFallback();
+    if (landingAutoplayBlocked) {
+        // Automatic retries can't get past the browser's block; only a click/keypress can.
+        showTapToStartMusicHint();
+        return false;
+    }
 
     // Give the Web Playback SDK device time to be ready after 'ready' (avoids first-load no-play with no errors).
     // Retries at 0ms, 500ms, 1.5s, 3s so we don't race the device on cold start.
@@ -1249,10 +1263,17 @@ async function startLandingPlaybackAfterConnect() {
         landingPlaybackStartInProgress = true;
         try {
             const started = await playRandomTrackFromLandingPlaylist();
-            if (started) {
+            if (started && !landingAutoplayBlocked) {
                 landingPlaybackStartPending = false;
                 clearLandingPlaybackGestureFallback();
                 return true;
+            }
+            if (landingAutoplayBlocked) {
+                // Spotify says "playing" but the browser is holding the sound. Keep the fallback armed and stop
+                // retrying automatically; the next click/keypress starts the music.
+                console.warn('[Landing] Browser is blocking sound; waiting for a click/keypress');
+                showTapToStartMusicHint();
+                return false;
             }
             console.warn(`[Landing] Automatic attempt after ${delayMs}ms did not start`);
         } finally {
@@ -2187,6 +2208,7 @@ async function initializeSpotify() {
             console.warn('[Spotify] autoplay_failed: the browser blocked sound until the page is clicked or a key is pressed');
             const gameContainer = document.getElementById('gameContainer');
             if (gameContainer && isElementVisible(gameContainer)) return; // board songs always start from a click
+            landingAutoplayBlocked = true;
             landingPlaybackStartPending = true;
             armLandingPlaybackGestureFallback();
             showTapToStartMusicHint();
@@ -2518,7 +2540,8 @@ async function playRandomTrackFromLandingPlaylist() {
         const track = shuffled[0];
         const result = await playSpotifyTrackOnActiveDevice(track, { waitLongerForStart: true });
         if (result.ok) {
-            console.log('Playing landing playlist track:', track.name, '-', track.artist);
+            console.log('Playing landing playlist track:', track.name, '-', track.artist,
+                landingAutoplayBlocked ? '(but the browser is blocking the sound until a click/keypress)' : '');
             // Diagnostic: Spotify's servers can report "playing" while the browser has blocked the sound.
             // The SDK's own local state shows what this tab is actually doing.
             setTimeout(async () => {
