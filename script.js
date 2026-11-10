@@ -1180,6 +1180,7 @@ function isLandingPageCurrentlyVisible() {
 }
 
 function clearLandingPlaybackGestureFallback() {
+    hideTapToStartMusicHint();
     if (landingPlaybackGestureCleanup) {
         landingPlaybackGestureCleanup();
         landingPlaybackGestureCleanup = null;
@@ -1192,11 +1193,14 @@ function armLandingPlaybackGestureFallback() {
     const retryOnGesture = async () => {
         if (!landingPlaybackStartPending || landingPlaybackStartInProgress) return;
         landingPlaybackStartInProgress = true;
+        hideTapToStartMusicHint();
         try {
             // Unlock Web Playback SDK for playback (browser may block until user gesture).
+            // Must be called synchronously inside the gesture handler, i.e. before any other await.
             if (spotifyPlayer && typeof spotifyPlayer.activateElement === 'function') {
                 try { await spotifyPlayer.activateElement(); } catch (e) { /* ignore */ }
             }
+            console.log('[Landing] Retrying landing song after user click/keypress');
             const started = await playRandomTrackFromLandingPlaylist();
             if (started) {
                 landingPlaybackStartPending = false;
@@ -1250,11 +1254,17 @@ async function startLandingPlaybackAfterConnect() {
                 clearLandingPlaybackGestureFallback();
                 return true;
             }
+            console.warn(`[Landing] Automatic attempt after ${delayMs}ms did not start`);
         } finally {
             landingPlaybackStartInProgress = false;
         }
     }
 
+    // Every automatic attempt failed. The click/keypress fallback is still armed; tell the user to tap.
+    if (landingPlaybackStartPending) {
+        console.warn('[Landing] All automatic attempts failed; waiting for a click/keypress');
+        showTapToStartMusicHint();
+    }
     return false;
 }
 
@@ -2135,6 +2145,11 @@ async function initializeSpotify() {
     
     // Initialize Web Playback SDK
     window.onSpotifyWebPlaybackSDKReady = () => {
+        // Guard: if the SDK calls this twice (e.g. it was loaded twice), don't create a second player/device.
+        if (spotifyPlayer) {
+            console.warn('[Spotify] SDK ready callback fired again; keeping the existing player');
+            return;
+        }
         spotifyPlayer = new Spotify.Player({
             name: 'Karaoke Jeopardy Player',
             getOAuthToken: cb => {
@@ -2164,6 +2179,18 @@ async function initializeSpotify() {
         spotifyPlayer.addListener('account_error', ({ message }) => {
             console.error('Spotify account error:', message);
         });
+
+        // Browser blocked the sound until the user interacts with the page. Typical right after the Spotify
+        // login redirect, because the freshly loaded page hasn't been clicked yet. Spotify's servers may still
+        // report the track as "playing", so without this the landing song can fail silently.
+        spotifyPlayer.addListener('autoplay_failed', () => {
+            console.warn('[Spotify] autoplay_failed: the browser blocked sound until the page is clicked or a key is pressed');
+            const gameContainer = document.getElementById('gameContainer');
+            if (gameContainer && isElementVisible(gameContainer)) return; // board songs always start from a click
+            landingPlaybackStartPending = true;
+            armLandingPlaybackGestureFallback();
+            showTapToStartMusicHint();
+        });
         
         // Ready event
         spotifyPlayer.addListener('ready', ({ device_id }) => {
@@ -2172,6 +2199,7 @@ async function initializeSpotify() {
             spotifyDevicePrimed = false;
             // Start landing playlist after connect, or if user is already on the landing page (e.g. skipped ahead of SDK ready).
             const shouldStartLandingMusic = playLandingPlaylistOnReady || isLandingPageCurrentlyVisible();
+            console.log(`[Spotify] Player ready (device ${device_id}). Landing song: ${shouldStartLandingMusic ? 'starting' : 'not started (not on landing page)'}`);
             if (playLandingPlaylistOnReady) playLandingPlaylistOnReady = false;
             if (shouldStartLandingMusic) {
                 startLandingPlaybackAfterConnect(); // retries after device settles and on first user gesture if needed
@@ -2191,8 +2219,13 @@ async function initializeSpotify() {
         spotifyPlayer.connect();
     };
     
-    // Load Spotify Web Playback SDK if not already loaded
-    if (!window.Spotify) {
+    // Load Spotify Web Playback SDK if not already loaded.
+    // index.html already includes the SDK <script>; if it's still loading, it will call
+    // onSpotifyWebPlaybackSDKReady (the handler above) by itself, so don't add a second copy.
+    const sdkScriptAlreadyOnPage = !!document.querySelector('script[src*="sdk.scdn.co/spotify-player.js"]');
+    if (!window.Spotify && sdkScriptAlreadyOnPage) {
+        console.log('[Spotify] SDK still loading; player will be created when it is ready');
+    } else if (!window.Spotify) {
         const script = document.createElement('script');
         script.src = 'https://sdk.scdn.co/spotify-player.js';
         script.onload = () => {
@@ -2458,27 +2491,75 @@ function shuffleArray(arr) {
 }
 
 /** Play a random track from the landing playlist (KARAOKE PARTY! screen). Called when user lands on landing page after Spotify login. Must satisfy MUSIC PLAYBACK CRITERIA (see playTileMusic). */
+/** Landing playlist tracks, fetched once per page load. Retries reuse it instead of re-fetching (3+ API calls each). */
+let landingPlaylistTracksCache = null;
+
+async function getLandingPlaylistTracks() {
+    if (landingPlaylistTracksCache && landingPlaylistTracksCache.length > 0) return landingPlaylistTracksCache;
+    const tracks = await loadPlaylistTracksById(LANDING_PLAYLIST_ID);
+    if (tracks && tracks.length > 0) landingPlaylistTracksCache = tracks;
+    return tracks;
+}
+
 async function playRandomTrackFromLandingPlaylist() {
     await ensureValidSpotifyAccessToken();
-    if (!spotifyAccessToken || !spotifyDeviceId) return false;
+    if (!spotifyAccessToken || !spotifyDeviceId) {
+        console.warn('[Landing] Not attempting: ' + (!spotifyAccessToken ? 'no access token' : 'player device not ready yet'));
+        return false;
+    }
     try {
-        const tracks = await loadPlaylistTracksById(LANDING_PLAYLIST_ID);
-        if (!tracks || tracks.length === 0) return false;
+        const tracks = await getLandingPlaylistTracks();
+        if (!tracks || tracks.length === 0) {
+            console.warn('[Landing] Landing playlist returned no tracks');
+            return false;
+        }
         // Shuffle so we get a different song each time (avoid same first track every connect)
         const shuffled = shuffleArray([...tracks]);
         const track = shuffled[0];
         const result = await playSpotifyTrackOnActiveDevice(track, { waitLongerForStart: true });
         if (result.ok) {
             console.log('Playing landing playlist track:', track.name, '-', track.artist);
+            // Diagnostic: Spotify's servers can report "playing" while the browser has blocked the sound.
+            // The SDK's own local state shows what this tab is actually doing.
+            setTimeout(async () => {
+                try {
+                    const local = spotifyPlayer ? await spotifyPlayer.getCurrentState() : null;
+                    console.log('[Landing] Local player state 1.5s after start: ' +
+                        (local ? `paused=${local.paused}, position_ms=${local.position}` : 'none (this tab is not the active device)'));
+                } catch (e) { /* ignore */ }
+            }, 1500);
             return true;
         } else {
-            console.warn(`Could not play landing playlist track (${result.status}):`, result.errorText);
+            console.warn(`[Landing] Could not play landing playlist track (${result.status}): ${result.errorText}`);
             return false;
         }
     } catch (error) {
-        console.warn('Could not play landing playlist track:', error);
+        console.warn('[Landing] Could not play landing playlist track:', error);
         return false;
     }
+}
+
+/** Small on-screen prompt shown when the browser is holding the landing song until the user interacts. */
+function showTapToStartMusicHint() {
+    const gameContainer = document.getElementById('gameContainer');
+    if (gameContainer && isElementVisible(gameContainer)) return; // board songs always start from a click
+    if (document.getElementById('tapToStartMusicHint')) return;
+    const hint = document.createElement('div');
+    hint.id = 'tapToStartMusicHint';
+    hint.setAttribute('role', 'status');
+    hint.textContent = '🎵 Tap anywhere to start the music';
+    hint.style.cssText = [
+        'position:fixed', 'left:50%', 'bottom:28px', 'transform:translateX(-50%)', 'z-index:10000',
+        'padding:12px 22px', 'border-radius:999px', 'background:rgba(0,0,0,0.75)', 'color:#fff',
+        'font-family:"Bebas Neue",sans-serif', 'font-size:1.4rem', 'letter-spacing:0.06em',
+        'box-shadow:0 0 18px rgba(255,50,150,0.6)', 'pointer-events:none'
+    ].join(';');
+    document.body.appendChild(hint);
+}
+
+function hideTapToStartMusicHint() {
+    const hint = document.getElementById('tapToStartMusicHint');
+    if (hint) hint.remove();
 }
 
 /**
