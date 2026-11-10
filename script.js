@@ -223,6 +223,15 @@ let fadeOutInterval = null; // For fade out animation
 let landingSpotifyFadeOutInterval = null; // For landing/title song Spotify fade out
 let landingSpotifyFadeOutTimeout = null; // Delayed start for landing/title song fade out
 let moveOnSafetyStopTimeout = null; // Clear when starting a new tile so we don't stop the new track
+/**
+ * Tile playback generation. Bumped when a new tile starts and when tile music is faded/stopped.
+ * An in-flight play attempt (including its retries) captures the value at start and aborts as soon
+ * as it no longer matches, so a slow/retrying attempt can never restart music after the user clicked
+ * another tile or pressed Move On (criteria #2 and #3).
+ */
+let tilePlaybackGeneration = 0;
+/** True while a tile click is starting its song; extra clicks are ignored so attempts can't overlap. */
+let tileClickInProgress = false;
 
 // Background music (Boogie Wonderland) - not auto-played on first four pages
 let backgroundMusic = null; // Audio element for background music
@@ -426,10 +435,33 @@ function loadAudioFiles() {
  * 4. No stutter or glitch on initial play – playback must start smoothly without stutter or glitch.
  * Fixes for one criterion must not break another (e.g. fixing stutter must not break start-from-beginning or fade/stop).
  * Diagnostics: [Music] console.warn logs (play/pause/state/start-from-middle) inform failure model; light retry when 204 but not started.
+ * "Started" = expected URI playing, OR same title + artist playing (Spotify track relinking plays a different URI for
+ *   the same song; treating that as failure caused retries that restarted/stalled a song that was already playing).
+ * tilePlaybackGeneration: every tile play, fade and stop bumps it; in-flight attempts abort when it changes.
+ * If a tile's song truly won't start, playTileMusic swaps in another song from the same category + value (up to 2 tries).
  */
 
 // Play music for a specific tile
+/**
+ * Pick a substitute track for a tile whose song won't play: same category, same value bucket,
+ * not already on the board and not already tried. Returns null if none is available.
+ */
+function pickReplacementTrackForTile(categoryIndex, valueIndex, triedUris) {
+    const pool = categoryPlaylists[categoryIndex];
+    if (!Array.isArray(pool) || pool.length === 0) return null;
+    const onBoard = new Set();
+    tileSpotifyTracks.forEach(col => (col || []).forEach(t => { if (t && t.uri) onBoard.add(t.uri); }));
+    const usable = (t) => t && t.uri && !onBoard.has(t.uri) && !triedUris.has(t.uri);
+    let candidates = pool.filter(t => usable(t) && t.valueBucket === valueIndex);
+    if (candidates.length === 0) candidates = pool.filter(usable); // tiny playlist: any unused song from the category
+    if (candidates.length === 0) return null;
+    return candidates[Math.floor(Math.random() * candidates.length)];
+}
+
 async function playTileMusic(categoryIndex, valueIndex) {
+    // New tile = new playback generation; any older in-flight attempt sees the change and aborts.
+    const myGeneration = ++tilePlaybackGeneration;
+    const isCurrent = () => tilePlaybackGeneration === myGeneration;
     try {
         // Cancel any pending "stop 600ms after Move on" so we never stop this new track (criterion #2)
         if (moveOnSafetyStopTimeout) {
@@ -480,12 +512,38 @@ async function playTileMusic(categoryIndex, valueIndex) {
                 console.log(`Track name for [${categoryIndex}][${valueIndex}]: ${tileAudioFileNames[categoryIndex][valueIndex]}`);
                 
                 try {
-                    const result = await playSpotifyTrackOnActiveDevice(track);
+                    const result = await playSpotifyTrackOnActiveDevice(track, { isCurrent });
+                    if (result.superseded) {
+                        console.log(`[playTileMusic] Attempt for "${track.name}" superseded by a newer click/stop; abandoning it.`);
+                        return;
+                    }
                     if (result.ok) {
                         console.log(`✓ Playing Spotify track: ${track.name} - ${track.artist}`);
                         return;
                     } else {
                         console.error(`Failed to play Spotify track (${result.status}):`, result.errorText);
+                        // Safety net: swap in another song from the same category + dollar value so the game doesn't stall.
+                        // The tile's stored track/name/cover are updated BEFORE the modal opens, so the answer reveal matches what plays.
+                        const tried = new Set([track.uri]);
+                        for (let swap = 0; swap < 2 && isCurrent(); swap++) {
+                            const replacement = pickReplacementTrackForTile(categoryIndex, valueIndex, tried);
+                            if (!replacement) break;
+                            tried.add(replacement.uri);
+                            console.warn(`[playTileMusic] Swapping unplayable "${track.name} - ${track.artist}" for "${replacement.name} - ${replacement.artist}"`);
+                            tileSpotifyTracks[categoryIndex][valueIndex] = replacement;
+                            if (!tileAudioFileNames[categoryIndex]) tileAudioFileNames[categoryIndex] = [];
+                            if (!tileAlbumCovers[categoryIndex]) tileAlbumCovers[categoryIndex] = [];
+                            tileAudioFileNames[categoryIndex][valueIndex] = `${replacement.name} - ${replacement.artist}`;
+                            tileAlbumCovers[categoryIndex][valueIndex] = replacement.albumCover || null;
+                            currentPlayingTrack = replacement;
+                            // retryOnce:false keeps the swap quick – one play + check, no device re-transfer.
+                            const swapResult = await playSpotifyTrackOnActiveDevice(replacement, { isCurrent, retryOnce: false });
+                            if (swapResult.superseded) return;
+                            if (swapResult.ok) {
+                                console.log(`✓ Playing replacement Spotify track: ${replacement.name} - ${replacement.artist}`);
+                                return;
+                            }
+                        }
                         // If using selected playlists, don't fall back to local files - just return
                         if (selectedCategoryPlaylists.length === 6) {
                             console.warn('Spotify playback failed, but using selected playlists - not falling back to local files');
@@ -841,16 +899,57 @@ async function getSpotifyPlaybackState() {
     }
 }
 
-async function waitForSpotifyTrackToStart(expectedUri, attempts = 5, delayMs = 175) {
+/** Lowercase song title with version/remaster/feat. suffixes and punctuation removed, for loose comparison. */
+function normalizeSongTitleForMatch(title) {
+    return String(title || '')
+        .toLowerCase()
+        .replace(/\s+-\s+.*$/, '')      // " - 2012 Remaster", " - Single Version", " - 7\" Single Version"
+        .replace(/\([^)]*\)|\[[^\]]*\]/g, '') // "(feat. X)", "[Remastered]"
+        .replace(/[^a-z0-9]+/g, '');
+}
+
+/**
+ * Is the expected song the item in this playback state?
+ * Exact URI match, OR same title + overlapping artist. The second case covers Spotify "track relinking":
+ * when the exact version in a playlist isn't playable in the user's market, Spotify silently plays an
+ * equivalent version that has a different URI. Without this, the song plays but we think it failed.
+ */
+function playbackStateMatchesTrack(state, expectedTrack) {
+    const item = state && state.item;
+    if (!item || !expectedTrack) return { matches: false, relinked: false };
+    if (item.uri === expectedTrack.uri) return { matches: true, relinked: false };
+    if (!expectedTrack.name) return { matches: false, relinked: false };
+    const sameTitle = normalizeSongTitleForMatch(item.name) === normalizeSongTitleForMatch(expectedTrack.name)
+        && normalizeSongTitleForMatch(item.name) !== '';
+    const expectedArtists = String(expectedTrack.artist || '').toLowerCase();
+    const artistOverlap = (item.artists || []).some(a => a && a.name && expectedArtists.includes(a.name.toLowerCase()));
+    return sameTitle && artistOverlap ? { matches: true, relinked: true } : { matches: false, relinked: false };
+}
+
+/**
+ * Poll until the expected song is playing on our device.
+ * expected: a track object {uri, name, artist} (preferred) or a bare URI string (exact match only).
+ * isCurrent: optional () => boolean; when it returns false the attempt was superseded and we stop polling.
+ */
+async function waitForSpotifyTrackToStart(expected, attempts = 5, delayMs = 175, isCurrent = null) {
+    const expectedTrack = typeof expected === 'string' ? { uri: expected } : expected;
     let lastState = null;
     for (let i = 0; i < attempts; i++) {
+        if (isCurrent && !isCurrent()) return false;
         const state = await getSpotifyPlaybackState();
         lastState = state;
-        const currentUri = state && state.item ? state.item.uri : null;
         const isPlaying = !!(state && state.is_playing);
         const deviceMatches = !spotifyDeviceId || !state || !state.device || state.device.id === spotifyDeviceId;
+        const match = playbackStateMatchesTrack(state, expectedTrack);
 
-        if (currentUri === expectedUri && isPlaying && deviceMatches) {
+        if (match.matches && isPlaying && deviceMatches) {
+            if (match.relinked) {
+                console.warn('[Music] Spotify is playing a different version of this song (relinked); accepting it. ' + JSON.stringify({
+                    requested_uri: expectedTrack.uri,
+                    playing_uri: state.item.uri,
+                    playing: `${state.item.name} - ${(state.item.artists || []).map(a => a.name).join(', ')}`
+                }));
+            }
             return true;
         }
 
@@ -858,15 +957,17 @@ async function waitForSpotifyTrackToStart(expectedUri, attempts = 5, delayMs = 1
             await new Promise(resolve => setTimeout(resolve, delayMs));
         }
     }
-    // Diagnostic: log last state when we give up (informs failure model)
+    // Diagnostic: log last state when we give up (informs failure model). Stringified so the console shows it without expanding.
     if (lastState != null) {
-        console.warn('[Music] waitForSpotifyTrackToStart failed', {
-            expectedUri,
+        console.warn('[Music] waitForSpotifyTrackToStart failed ' + JSON.stringify({
+            expectedUri: expectedTrack.uri,
+            expectedSong: expectedTrack.name ? `${expectedTrack.name} - ${expectedTrack.artist}` : null,
             currentUri: lastState.item ? lastState.item.uri : null,
+            currentSong: lastState.item ? `${lastState.item.name} - ${(lastState.item.artists || []).map(a => a.name).join(', ')}` : null,
             is_playing: lastState.is_playing,
             position_ms: lastState.progress_ms,
-            device_id: lastState.device ? lastState.device.id : null
-        });
+            device_matches: !lastState.device || !spotifyDeviceId || lastState.device.id === spotifyDeviceId
+        }));
     }
     return false;
 }
@@ -874,12 +975,16 @@ async function waitForSpotifyTrackToStart(expectedUri, attempts = 5, delayMs = 1
 /** Used by both landing playlist and tile playback. Must satisfy MUSIC PLAYBACK CRITERIA (see above). */
 async function playSpotifyTrackOnActiveDevice(track, options = {}) {
     await ensureValidSpotifyAccessToken();
-    const { retryOnce = true, waitLongerForStart = false, retried429 = false } = options;
+    const { retryOnce = true, waitLongerForStart = false, retried429 = false, isCurrent = null } = options;
     if (!spotifyAccessToken || !spotifyDeviceId || !track || !track.uri) {
         return { ok: false, status: 0, errorText: 'Missing Spotify device or track URI' };
     }
+    // Superseded = user clicked another tile or moved on while this attempt was in flight. Stop touching the player.
+    const superseded = () => !!(isCurrent && !isCurrent());
+    const SUPERSEDED_RESULT = { ok: false, status: 0, errorText: 'Superseded by a newer play/stop request', superseded: true };
 
     await ensureSpotifyPlaybackDeviceReady(false);
+    if (superseded()) return SUPERSEDED_RESULT;
     let setVolRes = null;
     try {
         setVolRes = await spotifyFetch(`https://api.spotify.com/v1/me/player/volume?volume_percent=100&device_id=${spotifyDeviceId}`, {
@@ -913,6 +1018,7 @@ async function playSpotifyTrackOnActiveDevice(track, options = {}) {
         await new Promise(r => setTimeout(r, 100));
     }
 
+    if (superseded()) return SUPERSEDED_RESULT;
     const response = await spotifyFetch(`https://api.spotify.com/v1/me/player/play?device_id=${spotifyDeviceId}`, {
         method: 'PUT',
         headers: {
@@ -929,7 +1035,8 @@ async function playSpotifyTrackOnActiveDevice(track, options = {}) {
 
     if (response.ok) {
         spotifyDevicePrimed = true;
-        const playbackStarted = await waitForSpotifyTrackToStart(track.uri, waitAttempts, waitDelayMs);
+        const playbackStarted = await waitForSpotifyTrackToStart(track, waitAttempts, waitDelayMs, isCurrent);
+        if (superseded()) return SUPERSEDED_RESULT;
         if (playbackStarted) {
             // Criterion #1: log if track may have started from middle (position_ms not 0)
             const stateAfter = await getSpotifyPlaybackState();
@@ -941,16 +1048,18 @@ async function playSpotifyTrackOnActiveDevice(track, options = {}) {
 
         // Diagnostic: log why playback didn't start (informs failure model)
         const stateFail = await getSpotifyPlaybackState();
-        console.warn('[Music] play 204 but playback did not start', {
+        console.warn('[Music] play 204 but playback did not start ' + JSON.stringify({
             uri: track.uri,
+            song: `${track.name} - ${track.artist}`,
             position_ms: stateFail ? stateFail.progress_ms : null,
             is_playing: stateFail ? stateFail.is_playing : null,
             current_uri: stateFail && stateFail.item ? stateFail.item.uri : null
-        });
+        }));
 
         // Light retry: one more play after short delay (no transfer) – often fixes race
         if (retryOnce) {
             await new Promise(r => setTimeout(r, 300));
+            if (superseded()) return SUPERSEDED_RESULT;
             const play2Res = await spotifyFetch(`https://api.spotify.com/v1/me/player/play?device_id=${spotifyDeviceId}`, {
                 method: 'PUT',
                 headers: {
@@ -959,7 +1068,8 @@ async function playSpotifyTrackOnActiveDevice(track, options = {}) {
                 body: JSON.stringify({ uris: [track.uri], position_ms: 0 })
             });
             if (play2Res.ok) {
-                const started2 = await waitForSpotifyTrackToStart(track.uri, waitAttempts + 2, waitDelayMs);
+                const started2 = await waitForSpotifyTrackToStart(track, waitAttempts + 2, waitDelayMs, isCurrent);
+                if (superseded()) return SUPERSEDED_RESULT;
                 if (started2) {
                     return { ok: true, status: play2Res.status, errorText: '' };
                 }
@@ -988,7 +1098,9 @@ async function playSpotifyTrackOnActiveDevice(track, options = {}) {
     // If Spotify has not fully switched to this device yet, or accepted the request without starting,
     // transfer and retry once.
     if (retryOnce && (response.ok || [404, 502, 503].includes(response.status))) {
+        if (superseded()) return SUPERSEDED_RESULT;
         await ensureSpotifyPlaybackDeviceReady(true);
+        if (superseded()) return SUPERSEDED_RESULT;
         await setSpotifyPlaybackVolume(100);
         const stateRetry = await getSpotifyPlaybackState();
         if (!stateRetry || stateRetry.is_playing) {
@@ -1003,6 +1115,7 @@ async function playSpotifyTrackOnActiveDevice(track, options = {}) {
             await new Promise(r => setTimeout(r, 100));
         }
 
+        if (superseded()) return SUPERSEDED_RESULT;
         const retryResponse = await spotifyFetch(`https://api.spotify.com/v1/me/player/play?device_id=${spotifyDeviceId}`, {
             method: 'PUT',
             headers: {
@@ -1018,7 +1131,8 @@ async function playSpotifyTrackOnActiveDevice(track, options = {}) {
             spotifyDevicePrimed = true;
             const retryWaitAttempts = waitLongerForStart ? 12 : 6;
             const retryWaitDelayMs = waitLongerForStart ? 250 : 200;
-            const retryStarted = await waitForSpotifyTrackToStart(track.uri, retryWaitAttempts, retryWaitDelayMs);
+            const retryStarted = await waitForSpotifyTrackToStart(track, retryWaitAttempts, retryWaitDelayMs, isCurrent);
+            if (superseded()) return SUPERSEDED_RESULT;
             if (retryStarted) {
                 const stateAfterRetry = await getSpotifyPlaybackState();
                 if (stateAfterRetry && stateAfterRetry.progress_ms != null && stateAfterRetry.progress_ms > 500) {
@@ -1027,7 +1141,7 @@ async function playSpotifyTrackOnActiveDevice(track, options = {}) {
                 return { ok: true, status: retryResponse.status, errorText: '' };
             }
 
-            console.warn('[Music] retry play 204 but playback still did not start', { uri: track.uri });
+            console.warn('[Music] retry play 204 but playback still did not start ' + JSON.stringify({ uri: track.uri, song: `${track.name} - ${track.artist}` }));
             return {
                 ok: false,
                 status: retryResponse.status,
@@ -1146,6 +1260,8 @@ async function startLandingPlaybackAfterConnect() {
 
 /** Fade out then stop tile/Spotify playback. Part of MUSIC PLAYBACK CRITERIA #3 – must not break #1, #2, #4. */
 async function fadeOutTileMusic() {
+    // Cancel any tile play attempt still retrying, so it can't restart music after this fade (criterion #3).
+    tilePlaybackGeneration++;
     await ensureValidSpotifyAccessToken();
     return new Promise((resolve) => {
         // Clear any existing fade out interval
@@ -1265,6 +1381,8 @@ async function fadeOutTileMusic() {
 
 /** Stop playback immediately (no fade). Part of MUSIC PLAYBACK CRITERIA #3. On 429, wait and retry so playback actually stops. */
 async function stopTileMusic() {
+    // Cancel any tile play attempt still retrying, so it can't restart music after this stop (criterion #3).
+    tilePlaybackGeneration++;
     await ensureValidSpotifyAccessToken();
     // Clear any existing fade out interval immediately
     if (fadeOutInterval) {
@@ -3596,10 +3714,22 @@ async function handleCellClick(cell, categoryIndex, valueIndex) {
         return;
     }
     
+    // The modal opens only after the song starts (or fails), which can take a few seconds on a slow start.
+    // Ignore further tile clicks meanwhile so two play attempts never run at once.
+    if (tileClickInProgress) {
+        console.log('[handleCellClick] Ignoring click – a tile is still starting its song');
+        return;
+    }
+    tileClickInProgress = true;
+    
     const categoryData = gameBoard[categoryIndex];
     
     // Play the specific music for this tile (await it so track name is stored)
-    await playTileMusic(categoryIndex, valueIndex);
+    try {
+        await playTileMusic(categoryIndex, valueIndex);
+    } finally {
+        tileClickInProgress = false;
+    }
     
     // Get the audio filename and album cover for this tile (after playTileMusic has stored it)
     const audioFileName = tileAudioFileNames[categoryIndex] && tileAudioFileNames[categoryIndex][valueIndex] 
