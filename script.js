@@ -1,52 +1,3 @@
-// ===== Spotify login popup support =====
-// Login happens in a popup so this page never reloads: it keeps the user's "Connect" click, which browsers
-// require before they allow sound, so the landing song can start the moment login succeeds.
-const SPOTIFY_AUTH_CHANNEL = 'karaoke-spotify-auth';
-const SPOTIFY_POPUP_RESULT_KEY = 'karaokeSpotifyPopupResult';
-const SPOTIFY_POPUP_STATE_KEY = 'karaokeSpotifyPopupState';
-const SPOTIFY_LOGIN_POPUP_NAME = 'karaokeSpotifyLogin';
-const SPOTIFY_POPUP_STATE_PREFIX = 'kp-popup-';
-
-/**
- * True when THIS page is the login popup returning from Spotify (?code=...&state=kp-popup-...).
- * It hands the code to the game window (BroadcastChannel + localStorage + opener.postMessage, so it works
- * even if the browser cut the popup's link to its opener), shows a short message, and closes itself.
- * The rest of the app does not start in the popup.
- */
-const IS_SPOTIFY_POPUP_RETURN = (function () {
-    try {
-        const params = new URLSearchParams(window.location.search);
-        const state = params.get('state') || '';
-        if (!state.startsWith(SPOTIFY_POPUP_STATE_PREFIX) || !(params.get('code') || params.get('error'))) return false;
-        const msg = { type: 'karaoke-spotify-auth', state, code: params.get('code'), error: params.get('error'), sentAt: Date.now() };
-        try {
-            const bc = new BroadcastChannel(SPOTIFY_AUTH_CHANNEL);
-            bc.onmessage = (e) => {
-                if (e.data && e.data.type === 'karaoke-spotify-auth-ack' && e.data.state === state) {
-                    try { window.close(); } catch (err) { /* ignore */ }
-                }
-            };
-            bc.postMessage(msg);
-        } catch (e) { /* BroadcastChannel unsupported */ }
-        try { localStorage.setItem(SPOTIFY_POPUP_RESULT_KEY, JSON.stringify(msg)); } catch (e) { /* ignore */ }
-        try { if (window.opener && !window.opener.closed) window.opener.postMessage(msg, window.location.origin); } catch (e) { /* ignore */ }
-        try { window.history.replaceState({}, document.title, window.location.pathname); } catch (e) { /* ignore */ }
-        const render = () => {
-            document.title = msg.error ? 'Spotify login cancelled' : 'Spotify connected';
-            document.body.innerHTML = '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;' +
-                'background:#14051f;color:#fff;font-family:sans-serif;font-size:20px;text-align:center;padding:24px;">' +
-                (msg.error ? 'Spotify login was cancelled. You can close this window.'
-                           : '\u2705 Connected to Spotify!<br><br>Returning to the game&hellip; (you can close this window)') +
-                '</div>';
-        };
-        if (document.body) render(); else document.addEventListener('DOMContentLoaded', render);
-        setTimeout(() => { try { window.close(); } catch (e) { /* ignore */ } }, 1500);
-        return true;
-    } catch (e) {
-        return false;
-    }
-})();
-
 /** Timing diagnostics for "how long from Connect to music". */
 let spotifyLoginStartedAt = null;
 let spotifyLoginTimingBase = 'clicking Connect';
@@ -1257,13 +1208,35 @@ function armLandingPlaybackGestureFallback() {
         if (!landingPlaybackStartPending || landingPlaybackStartInProgress) return;
         landingPlaybackStartInProgress = true;
         hideTapToStartMusicHint();
+        const wasBlocked = landingAutoplayBlocked;
         try {
             // Unlock Web Playback SDK for playback (browser may block until user gesture).
-            // Must be called synchronously inside the gesture handler, i.e. before any other await.
+            // These calls must happen synchronously inside the gesture handler, i.e. before any await.
+            let activatePromise = null;
+            let resumePromise = null;
             if (spotifyPlayer && typeof spotifyPlayer.activateElement === 'function') {
-                try { await spotifyPlayer.activateElement(); } catch (e) { /* ignore */ }
+                try { activatePromise = spotifyPlayer.activateElement(); } catch (e) { /* ignore */ }
             }
+            // Fast path: the browser blocked a song that is already loaded (at 0:00) in this tab's player.
+            // Resuming it right inside the tap starts the sound instantly, with no Spotify server round trips.
+            if (wasBlocked && spotifyPlayer && typeof spotifyPlayer.resume === 'function') {
+                try { resumePromise = spotifyPlayer.resume(); } catch (e) { /* ignore */ }
+            }
+            try { await activatePromise; } catch (e) { /* ignore */ }
             landingAutoplayBlocked = false; // a real click/keypress unlocks audio for this tab
+            if (resumePromise) {
+                try { await resumePromise; } catch (e) { /* ignore */ }
+                await new Promise(r => setTimeout(r, 700));
+                let local = null;
+                try { local = await spotifyPlayer.getCurrentState(); } catch (e) { local = null; }
+                if (local && local.paused === false && !landingAutoplayBlocked) {
+                    console.log('[Landing] Tap resumed the landing song instantly');
+                    landingPlaybackStartPending = false;
+                    clearLandingPlaybackGestureFallback();
+                    return;
+                }
+                console.log('[Landing] Instant resume did not start the song; starting a song through Spotify instead');
+            }
             console.log('[Landing] Retrying landing song after user click/keypress');
             const started = await playRandomTrackFromLandingPlaylist();
             if (started && !landingAutoplayBlocked) {
@@ -2087,48 +2060,18 @@ async function spotifyFetch(url, options = {}) {
 }
 
 async function startSpotifyLogin() {
-    // ---- Everything up to the first await runs inside the click (needed for popups + audio unlock) ----
-    spotifyLoginStartedAt = performance.now();
-    spotifyLoginTimingBase = 'clicking Connect';
-    const player = createSpotifyPlayerIfNeeded();
-    if (player && typeof player.activateElement === 'function') {
-        try { player.activateElement(); } catch (e) { /* ignore */ }
-    }
-    let popup = null;
-    try {
-        popup = window.open('', SPOTIFY_LOGIN_POPUP_NAME, 'popup=yes,width=520,height=760');
-    } catch (e) {
-        popup = null;
-    }
-    if (popup) {
-        try {
-            popup.document.title = 'Connecting to Spotify…';
-            popup.document.body.innerHTML = '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;' +
-                'background:#14051f;color:#fff;font-family:sans-serif;font-size:20px;">Opening Spotify&hellip;</div>';
-        } catch (e) { /* ignore */ }
-    }
-    setConnectPageStatus(popup ? 'Log in to Spotify in the popup window…' : 'Opening Spotify…');
-    console.log('[Spotify] Connect clicked — starting login' + (popup ? ' (popup)' : ' (popup blocked; using full-page redirect)'));
+    setConnectPageStatus('Opening Spotify…');
+    console.log('[Spotify] Connect clicked — starting login');
     try {
         // Clear stale saved tokens before a fresh login, unless a player is already connecting/connected with
         // them (clearing would make that player fail auth and get torn down; the new token replaces them anyway).
         if (!spotifyReady && !(spotifyPlayer && spotifyPlayer.__kpConnectRequested)) {
             clearSpotifyTokens();
         }
-        if (popup) {
-            const state = SPOTIFY_POPUP_STATE_PREFIX + Array.from(window.crypto.getRandomValues(new Uint8Array(12)), b => b.toString(16).padStart(2, '0')).join('');
-            sessionStorage.setItem(SPOTIFY_POPUP_STATE_KEY, state);
-            listenForSpotifyPopupResult(state, popup);
-            const authUrl = await getSpotifyAuthUrl(state);
-            popup.location.href = authUrl;
-            try { popup.focus(); } catch (e) { /* ignore */ }
-            return;
-        }
         const authUrl = await getSpotifyAuthUrl();
         console.log('[Spotify] Redirecting to authorize');
         window.location.assign(authUrl);
     } catch (error) {
-        if (popup) { try { popup.close(); } catch (e) { /* ignore */ } }
         console.error('[Spotify] Login failed:', error);
         const msg = 'Could not start Spotify login. Use HTTPS or http://localhost (not a local file).';
         setConnectPageStatus(msg, true);
@@ -2143,7 +2086,7 @@ function setConnectPageStatus(message, isError) {
     el.style.color = isError ? '#ff8888' : 'rgba(255,255,255,0.75)';
 }
 
-async function getSpotifyAuthUrl(state) {
+async function getSpotifyAuthUrl() {
     const pkce = await generatePKCE();
     const params = new URLSearchParams({
         client_id: SPOTIFY_CLIENT_ID,
@@ -2154,89 +2097,15 @@ async function getSpotifyAuthUrl(state) {
         code_challenge: pkce.codeChallenge,
         show_dialog: true
     });
-    if (state) params.set('state', state);
     const authUrl = `https://accounts.spotify.com/authorize?${params.toString()}`;
     console.log('Spotify Auth URL:', authUrl);
     console.log('Redirect URI being sent:', SPOTIFY_REDIRECT_URI);
     return authUrl;
 }
 
-let spotifyPopupListenerCleanup = null;
-
-/** Wait for the login popup to hand back the authorization code (via any of three channels). */
-function listenForSpotifyPopupResult(expectedState, popup) {
-    if (spotifyPopupListenerCleanup) spotifyPopupListenerCleanup();
-    let handled = false;
-    let bc = null;
-    let closedPoll = null;
-    let giveUpTimer = null;
-
-    const cleanup = () => {
-        window.removeEventListener('message', onMessage);
-        window.removeEventListener('storage', onStorage);
-        window.removeEventListener('focus', checkStoredResult);
-        if (bc) { try { bc.close(); } catch (e) { /* ignore */ } }
-        if (closedPoll) clearInterval(closedPoll);
-        if (giveUpTimer) clearTimeout(giveUpTimer);
-        spotifyPopupListenerCleanup = null;
-    };
-    const handle = (msg) => {
-        if (handled || !msg || msg.type !== 'karaoke-spotify-auth' || msg.state !== expectedState) return;
-        handled = true;
-        logLoginTiming('Login popup returned');
-        try { if (bc) bc.postMessage({ type: 'karaoke-spotify-auth-ack', state: expectedState }); } catch (e) { /* ignore */ }
-        cleanup();
-        sessionStorage.removeItem(SPOTIFY_POPUP_STATE_KEY);
-        try { localStorage.removeItem(SPOTIFY_POPUP_RESULT_KEY); } catch (e) { /* ignore */ }
-        try { if (popup && !popup.closed) popup.close(); } catch (e) { /* ignore */ }
-        if (msg.error || !msg.code) {
-            setConnectPageStatus(msg.error === 'access_denied' ? 'Spotify login was cancelled.' : ('Spotify login failed: ' + (msg.error || 'no code returned')), true);
-            return;
-        }
-        setConnectPageStatus('Connecting…');
-        completeSpotifyLoginWithCode(msg.code);
-    };
-    const onMessage = (e) => { if (e.origin === window.location.origin) handle(e.data); };
-    const onStorage = (e) => {
-        if (e.key === SPOTIFY_POPUP_RESULT_KEY && e.newValue) {
-            try { handle(JSON.parse(e.newValue)); } catch (err) { /* ignore */ }
-        }
-    };
-    function checkStoredResult() {
-        try {
-            const raw = localStorage.getItem(SPOTIFY_POPUP_RESULT_KEY);
-            if (raw) handle(JSON.parse(raw));
-        } catch (e) { /* ignore */ }
-    }
-
-    try {
-        bc = new BroadcastChannel(SPOTIFY_AUTH_CHANNEL);
-        bc.onmessage = (e) => handle(e.data);
-    } catch (e) { bc = null; }
-    window.addEventListener('message', onMessage);
-    window.addEventListener('storage', onStorage);
-    window.addEventListener('focus', checkStoredResult);
-    // If the popup is closed without finishing, say so (but keep listening: some browsers report a popup as
-    // "closed" while it's on Spotify's site).
-    closedPoll = setInterval(() => {
-        let closed = false;
-        try { closed = !popup || popup.closed; } catch (e) { closed = false; }
-        if (closed && !handled) {
-            clearInterval(closedPoll);
-            closedPoll = null;
-            setTimeout(() => {
-                checkStoredResult();
-                if (!handled) setConnectPageStatus('Waiting for Spotify login… If you closed the window, click Connect to Spotify again.');
-            }, 1500);
-        }
-    }, 700);
-    giveUpTimer = setTimeout(cleanup, 15 * 60 * 1000);
-    spotifyPopupListenerCleanup = cleanup;
-}
-
 /**
  * Exchange the authorization code for tokens, then connect the player and go to the landing page.
- * Shared by the popup flow and the full-page redirect flow.
+ * Used by the full-page redirect flow (Spotify sends the browser back here with ?code=...).
  */
 async function completeSpotifyLoginWithCode(code) {
     const codeVerifier = sessionStorage.getItem('pkce_verifier');
@@ -2290,7 +2159,6 @@ async function completeSpotifyLoginWithCode(code) {
  * After a fresh login: use the page's existing Spotify player if it already connected (e.g. from a saved
  * session at page load) instead of destroying it and creating a second one. Seen live: a second player
  * created in the same page reported "ready" but Spotify answered every request with 404 "Device not found".
- * Reusing also keeps the player that the Connect click activated for audio.
  */
 function connectOrReuseSpotifyPlayer() {
     if (spotifyPlayer && spotifyPlayer.__kpConnectRequested) {
@@ -2356,7 +2224,7 @@ async function handleSpotifyCallback() {
     const code = urlParams.get('code');
     
     if (code) {
-        // Authorization Code flow (full-page redirect; used when the login popup was blocked)
+        // Authorization Code flow (full-page redirect back from Spotify)
         spotifyLoginStartedAt = 0;
         spotifyLoginTimingBase = 'this page started loading';
         window.history.replaceState({}, document.title, window.location.pathname);
@@ -2392,7 +2260,7 @@ async function handleSpotifyCallback() {
  */
 function createSpotifyPlayerIfNeeded() {
     if (spotifyPlayer) return spotifyPlayer;
-    if (IS_SPOTIFY_POPUP_RETURN || !window.Spotify || !window.Spotify.Player) return null;
+    if (!window.Spotify || !window.Spotify.Player) return null;
     spotifyPlayer = new Spotify.Player({
         name: 'Karaoke Jeopardy Player',
         getOAuthToken: cb => {
@@ -2835,15 +2703,10 @@ async function playRandomTrackFromLandingPlaylist() {
             logLoginTiming('Landing song confirmed playing');
             console.log('Playing landing playlist track:', track.name, '-', track.artist,
                 landingAutoplayBlocked ? '(but the browser is blocking the sound until a click/keypress)' : '');
-            // Diagnostic: Spotify's servers can report "playing" while the browser has blocked the sound.
-            // The SDK's own local state shows what this tab is actually doing.
-            setTimeout(async () => {
-                try {
-                    const local = spotifyPlayer ? await spotifyPlayer.getCurrentState() : null;
-                    console.log('[Landing] Local player state 1.5s after start: ' +
-                        (local ? `paused=${local.paused}, position_ms=${local.position}` : 'none (this tab is not the active device)'));
-                } catch (e) { /* ignore */ }
-            }, 1500);
+            // Spotify's servers can report "playing" while the browser keeps this tab silent (and the
+            // autoplay_failed event doesn't always arrive). Check what THIS tab is doing; if it's silent,
+            // show the tap prompt so the page is never quietly stuck.
+            setTimeout(() => { verifyLandingSongAudible(track); }, 1500);
             return true;
         } else {
             console.warn(`[Landing] Could not play landing playlist track (${result.status}): ${result.errorText}`);
@@ -2856,6 +2719,24 @@ async function playRandomTrackFromLandingPlaylist() {
         console.warn('[Landing] Could not play landing playlist track:', error);
         return false;
     }
+}
+
+/** Landing song "started" according to Spotify: confirm this tab is really playing; otherwise prompt for a tap. */
+async function verifyLandingSongAudible(track) {
+    let local = null;
+    try { local = spotifyPlayer ? await spotifyPlayer.getCurrentState() : null; } catch (e) { local = null; }
+    const audible = !!(local && local.paused === false);
+    console.log('[Landing] Local player state 1.5s after start: ' +
+        (local ? `paused=${local.paused}, position_ms=${local.position}` : 'none (this tab is not the active device)'));
+    if (audible) return;
+    const gameContainer = document.getElementById('gameContainer');
+    if (gameContainer && isElementVisible(gameContainer)) return; // board songs are handled separately
+    if (landingPlaybackStartInProgress) return; // a tap-triggered start is already underway
+    console.warn('[Landing] Spotify reports playing but this tab is silent; showing the tap prompt');
+    landingAutoplayBlocked = true;
+    landingPlaybackStartPending = true;
+    armLandingPlaybackGestureFallback();
+    showTapToStartMusicHint();
 }
 
 /** Small on-screen prompt shown when the browser is holding the landing song until the user interacts. */
@@ -5315,10 +5196,9 @@ function updateScoreboardDisplay() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-    if (IS_SPOTIFY_POPUP_RETURN) return; // this is the login popup; it hands off and closes
     console.log('[Karaoke Party] App ready');
 
-    // Create the Spotify player early (not connected) so the Connect click can activate it for audio.
+    // Create the Spotify player early (not connected) so the first click on the page can activate it for audio.
     if (window.Spotify && window.Spotify.Player) {
         createSpotifyPlayerIfNeeded();
     } else if (!spotifyAccessToken) {
